@@ -1,33 +1,69 @@
 use std::{borrow::Cow, collections::HashMap};
 
 use itertools::Itertools;
-use regex::Captures;
+use regex::{Captures, Regex};
 
 use crate::consts::{VARIANTS, VARIANT_SEARCHER};
 use crate::defaults::{RE, SORTER};
-use crate::options::{FinderRegex, Options, Sorter};
+use crate::options::{FinderRegex, Options, RegexPair, Sorter};
 
 pub fn has_classes(file_contents: &str, options: &Options) -> bool {
-    let regex = match &options.regex {
-        FinderRegex::DefaultRegex => &RE,
-        FinderRegex::CustomRegex(regex) => regex,
-    };
-
-    regex.is_match(file_contents)
+    match &options.regex {
+        FinderRegex::DefaultRegex => *&RE.is_match(file_contents),
+        FinderRegex::CustomRegex(regex) => regex.is_match(file_contents),
+        FinderRegex::CustomRegexEntries(entries) => entries
+            .iter()
+            .any(|(container_regex, _)| container_regex.is_match(file_contents)),
+    }
 }
 
 pub fn sort_file_contents<'a>(file_contents: &'a str, options: &Options) -> Cow<'a, str> {
-    let regex = match &options.regex {
-        FinderRegex::DefaultRegex => &RE,
-        FinderRegex::CustomRegex(regex) => regex,
+    let (regex, entries): (Option<&Regex>, Option<Vec<RegexPair>>) = match &options.regex {
+        FinderRegex::DefaultRegex => (Some(&RE), None),
+        FinderRegex::CustomRegex(regex) => (Some(regex), None),
+        FinderRegex::CustomRegexEntries(pairs) => {
+            let mut all_pairs = pairs.clone();
+            all_pairs.insert(0, (RE.clone(), None));
+            (None, Some(all_pairs))
+        }
     };
 
-    regex.replace_all(file_contents, |caps: &Captures| {
-        let classes = &caps[1];
-        let sorted_classes = sort_classes(classes, options);
+    if let Some(regex) = regex {
+        regex.replace_all(file_contents, |caps: &Captures| {
+            let classes = &caps[1];
+            let sorted_classes = sort_classes(classes, options);
 
-        caps[0].replace(classes, &sorted_classes)
-    })
+            caps[0].replace(classes, &sorted_classes)
+        })
+    } else if let Some(entries) = entries {
+        let mut file_result = file_contents.to_string();
+        for entry in entries {
+            let (container_regex, class_regex) = entry;
+
+            file_result = container_regex
+                .replace_all(&file_result, |caps: &Captures| {
+                    let container = &caps[1];
+                    if let Some(class_regex) = &class_regex {
+                        caps[0].replace(
+                            container,
+                            &class_regex.replace_all(container, |caps: &Captures| {
+                                let classes = &caps[1];
+                                let sorted_classes = sort_classes(classes, options);
+                                caps[0].replace(classes, &sorted_classes)
+                            }),
+                        )
+                    } else {
+                        let sorted_classes = sort_classes(container, options);
+                        caps[0].replace(container, &sorted_classes)
+                    }
+                })
+                .to_string();
+        }
+
+        file_result.into()
+    } else {
+        file_contents.into()
+    }
 }
 
 fn sort_classes(class_string: &str, options: &Options) -> String {

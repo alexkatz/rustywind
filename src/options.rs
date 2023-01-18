@@ -22,10 +22,20 @@ pub enum WriteMode {
     CheckFormatted,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum CustomRegexEntryInput {
+    String(String),
+    Pair((String, String)),
+}
+
+pub type RegexPair = (Regex, Option<Regex>);
+
 #[derive(Debug)]
 pub enum FinderRegex {
     DefaultRegex,
     CustomRegex(Regex),
+    CustomRegexEntries(Vec<RegexPair>),
 }
 
 #[derive(Debug)]
@@ -37,7 +47,8 @@ pub enum Sorter {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ConfigFileContents {
-    sort_order: Vec<String>,
+    sort_order: Option<Vec<String>>,
+    custom_regex: Option<Vec<CustomRegexEntryInput>>,
 }
 
 #[derive(Debug)]
@@ -65,21 +76,33 @@ impl Options {
 
         let starting_paths = get_starting_path_from_cli(&cli);
         let search_paths = get_search_paths_from_starting_paths(&starting_paths);
+        let cli_regex = get_custom_regex_from_cli(&cli)?;
+        let (sorter, config_regex) = get_options_from_config(&cli)?;
 
         Ok(Options {
             stdin,
             starting_paths,
             search_paths,
             write_mode: get_write_mode_from_cli(&cli),
-            regex: get_custom_regex_from_cli(&cli)?,
-            sorter: get_sorter_from_cli(&cli)?,
+            regex: match cli_regex {
+                // if custom regex is received from the CLI, it takes highest priority
+                FinderRegex::CustomRegex(_) => cli_regex,
+                // if no regex was received from the CLI, check if regex was supplied in config file
+                FinderRegex::DefaultRegex => match config_regex {
+                    Some(entries) => FinderRegex::CustomRegexEntries(entries),
+                    None => FinderRegex::DefaultRegex,
+                },
+                // It's not currently possible to pass in nested entry arrays from the CLI
+                FinderRegex::CustomRegexEntries(_) => unreachable!(),
+            },
+            sorter,
             allow_duplicates: cli.allow_duplicates,
             ignored_files: get_ignored_files_from_cli(&cli),
         })
     }
 }
 
-fn get_sorter_from_cli(cli: &Cli) -> Result<Sorter> {
+fn get_options_from_config(cli: &Cli) -> Result<(Sorter, Option<Vec<RegexPair>>)> {
     match &cli.config_file {
         Some(config_file) => {
             let file_contents = fs::read_to_string(config_file)
@@ -88,15 +111,16 @@ fn get_sorter_from_cli(cli: &Cli) -> Result<Sorter> {
 
             let config_file: ConfigFileContents = serde_json::from_str(&file_contents?)
                 .wrap_err_with(|| format!("Error while parsing the config file {config_file}"))
-                .with_suggestion(|| {
-                    format!("Make sure the {config_file} is valid json, with the expected format")
-                })?;
+                .with_suggestion(|| format!("Make sure the config_file {config_file} is valid json with the expected format"))?;
 
-            Ok(Sorter::CustomSorter(parse_custom_sorter(
-                config_file.sort_order,
-            )))
+            Ok((
+                config_file
+                    .sort_order
+                    .map_or(Sorter::DefaultSorter, parse_custom_sorter),
+                config_file.custom_regex.map(parse_custom_regex),
+            ))
         }
-        None => Ok(Sorter::DefaultSorter),
+        None => Ok((Sorter::DefaultSorter, None)),
     }
 }
 
@@ -163,10 +187,39 @@ fn get_ignored_files_from_cli(cli: &Cli) -> HashSet<PathBuf> {
     }
 }
 
-fn parse_custom_sorter(contents: Vec<String>) -> HashMap<String, usize> {
-    contents
+fn parse_custom_sorter(contents: Vec<String>) -> Sorter {
+    Sorter::CustomSorter(
+        contents
+            .into_iter()
+            .enumerate()
+            .map(|(index, class)| (class, index))
+            .collect(),
+    )
+}
+
+fn parse_custom_regex(entries: Vec<CustomRegexEntryInput>) -> Vec<RegexPair> {
+    entries.iter().for_each(|entry| {
+        match entry {
+            CustomRegexEntryInput::String(container_string) => {
+                println!("{}", container_string);
+            }
+            CustomRegexEntryInput::Pair((container_string, classes_string)) => {
+                println!("[{}, {}]", container_string, classes_string);
+            }
+        };
+    });
+
+    entries
         .into_iter()
-        .enumerate()
-        .map(|(index, class)| (class, index))
+        .map(|entry| match entry {
+            CustomRegexEntryInput::Pair((container_regex_string, class_regex_string)) => (
+                Regex::new(&container_regex_string).unwrap(),
+                Some(Regex::new(&class_regex_string).unwrap()),
+            ),
+
+            CustomRegexEntryInput::String(container_regex_string) => {
+                (Regex::new(&container_regex_string).unwrap(), None)
+            }
+        })
         .collect()
 }
